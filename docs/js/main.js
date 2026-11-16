@@ -19,8 +19,12 @@ const listeners = new Set();
 const emit = () => { app.version += 1; listeners.forEach((fn) => fn(app.version)); };
 
 function useApp() {
-  const [, set] = useState(0);
-  useEffect(() => { listeners.add(set); return () => listeners.delete(set); }, []);
+  const [, set] = useState(app.version);
+  useEffect(() => {
+    listeners.add(set);
+    set(app.version); // catch up on anything that changed before this listener was attached (slow or background tabs)
+    return () => listeners.delete(set);
+  }, []);
   return app;
 }
 

@@ -2,6 +2,7 @@ import { html, render, useState, useEffect, useRef, useMemo } from '../vendor/pr
 import * as store from './store.js';
 import { parseAny, validateCards, countByLevel, cardKind } from './parser.js';
 import { toHtml, plain, humanInterval, humanDue } from './render.js';
+import { runSync, checkAccess, SyncError } from './sync.js';
 import {
   DEFAULT_SETTINGS, Rating, replay, applyOne, makeScheduler, stateOf, effective, kindOf,
   buildQueue, nextCard, previewGrades, describeState, conceptKey, dueTime,
@@ -12,6 +13,7 @@ import {
 const app = {
   ready: false, cards: [], byId: new Map(), events: [], states: new Map(),
   settings: { ...DEFAULT_SETTINGS }, device: '', seq: 0, sched: null, version: 0, error: '',
+  sync: { token: '', repo: '', shas: {}, pushed: {}, last: 0, report: null, error: '', busy: false },
 };
 const listeners = new Set();
 const emit = () => { app.version += 1; listeners.forEach((fn) => fn(app.version)); };
@@ -33,9 +35,10 @@ function rebuild() {
 }
 
 async function load() {
-  const [cards, events, settings, device] = await Promise.all([
-    store.getCards(), store.getEvents(), store.getMeta('settings'), store.getMeta('device'),
+  const [cards, events, settings, device, sync] = await Promise.all([
+    store.getCards(), store.getEvents(), store.getMeta('settings'), store.getMeta('device'), store.getMeta('sync'),
   ]);
+  app.sync = { token: '', repo: '', shas: {}, pushed: {}, last: 0, report: null, error: '', busy: false, ...(sync || {}) };
   app.settings = { ...DEFAULT_SETTINGS, ...(settings || {}) };
   app.device = device || 'd' + Math.random().toString(36).slice(2, 8);
   if (!device) await store.setMeta('device', app.device);
@@ -46,6 +49,7 @@ async function load() {
   app.ready = true;
   store.requestPersistence();
   emit();
+  if (app.sync.token) syncNow();
 }
 
 function newId() {
@@ -101,19 +105,105 @@ async function runImport(parsed, plan, restartChanged) {
   emit();
 }
 
+function captureCard(id, content, stamp) {
+  return {
+    id, type: 'M-FACT', status: 'active', c: (content.c || '').trim(), q: (content.q || '').trim(), a: (content.a || '').trim(),
+    x: (content.x || '').trim(), s: 'captured in the app',
+    tags: ['capture'], depth: 'standard', section: '', order: 0, file: 'Captured cards', added: stamp, origin: 'capture',
+    course: 'CAP', lesson: '', slug: id.split('.')[1] || id, level: 'M', n: 1, hash: '',
+  };
+}
+
 async function addCapture({ c, q, a, x }) {
   const stamp = Date.now();
-  const id = `CAP.${stamp.toString(36)}.M1`;
-  const card = {
-    id, type: 'M-FACT', status: 'active', c: c.trim(), q: q.trim(), a: a.trim(), x: (x || '').trim(), s: 'captured in the app',
-    tags: ['capture'], depth: 'standard', section: '', order: 0, file: 'Captured cards', added: stamp, origin: 'capture',
-    course: 'CAP', lesson: '', slug: stamp.toString(36), level: 'M', n: 1, hash: '',
-  };
+  const id = `CAP.${stamp.toString(36)}${Math.random().toString(36).slice(2, 4)}.M1`;
+  const card = captureCard(id, { c, q, a, x }, stamp);
   await store.putCards([card]);
   setCards([...app.cards, card]);
   await log('capture', { card: id, content: { c: card.c, q: card.q, a: card.a, x: card.x } });
   await log('bump', { card: id });
   return card;
+}
+
+// ---------------------------------------------------------------- sync
+
+const saveSync = () => {
+  const { token, repo, shas, pushed, last, report } = app.sync;
+  return store.setMeta('sync', { token, repo, shas, pushed, last, report });
+};
+
+async function importFromRepo(path, text) {
+  const name = path.split('/').pop().replace(/\.md$/, '');
+  const parsed = parseAny(text, name);
+  const checks = validateCards(parsed.cards);
+  const bad = parsed.problems.length + checks.errors.length;
+  if (bad || !parsed.cards.length) return { ok: false, note: bad ? `${name}: not imported, ${bad} ${bad === 1 ? 'problem' : 'problems'} found` : `${name}: no cards found` };
+  const plan = planImport(parsed);
+  if (!plan.fresh.length && !plan.changed.length && !plan.retiring.length) return { ok: true };
+  await runImport(parsed, plan, false);
+  return { ok: true, note: `${name}: ${plan.fresh.length} new, ${plan.changed.length} updated` };
+}
+
+async function addForeignEvents(events) {
+  const have = new Set(app.events.map((e) => e.id));
+  const fresh = events.filter((e) => !have.has(e.id));
+  if (!fresh.length) return 0;
+  const cards = [];
+  for (const ev of fresh) {
+    if (ev.type === 'capture' && ev.content && !app.byId.has(ev.card) && !cards.some((c) => c.id === ev.card)) cards.push(captureCard(ev.card, ev.content, ev.t));
+  }
+  if (cards.length) { await store.putCards(cards); setCards([...app.cards, ...cards]); }
+  await store.addEvents(fresh);
+  app.events.push(...fresh);
+  app.seq = fresh.reduce((m, e) => Math.max(m, e.seq || 0), app.seq);
+  rebuild();
+  emit();
+  return fresh.length;
+}
+
+let syncing = null;
+function syncNow() {
+  if (!app.sync.token || !app.ready) return Promise.resolve();
+  if (syncing) return syncing;
+  app.sync.busy = true;
+  emit();
+  syncing = (async () => {
+    try {
+      const out = await runSync({
+        token: app.sync.token, repo: app.sync.repo, device: app.device, shas: app.sync.shas, pushed: app.sync.pushed,
+        events: app.events, importCardFile: importFromRepo, addForeignEvents,
+      });
+      app.sync = { ...app.sync, shas: out.shas, pushed: out.pushed, last: Date.now(), report: out.report, error: '', errorKind: '' };
+    } catch (e) {
+      app.sync = { ...app.sync, error: e instanceof SyncError ? e.message : 'Sync failed: ' + e.message, errorKind: e.kind || '' };
+    }
+    app.sync.busy = false;
+    syncing = null;
+    try { await saveSync(); } catch (e) { /* storage trouble is reported elsewhere */ }
+    emit();
+  })();
+  return syncing;
+}
+
+async function connectSync(token, repo) {
+  const info = await checkAccess({ token, repo });
+  if (!info.isPrivate) throw new SyncError('public', 'That repository is public, so your history would be visible to anyone. Use a private repository.');
+  if (!info.canWrite) throw new SyncError('denied', 'The token can read this repository but not write to it. Set Contents to "Read and write".');
+  app.sync = { ...app.sync, token, repo, shas: {}, pushed: {}, error: '' };
+  await saveSync();
+  await syncNow();
+}
+
+async function disconnectSync() {
+  app.sync = { token: '', repo: app.sync.repo, shas: {}, pushed: {}, last: 0, report: null, error: '', busy: false };
+  await saveSync();
+  emit();
+}
+
+function pendingCount() {
+  const mine = app.events.filter((e) => e.device === app.device).length;
+  const sent = Object.values(app.sync.pushed || {}).reduce((a, b) => a + b, 0);
+  return Math.max(0, mine - sent);
 }
 
 function download(name, text, type = 'application/json') {
@@ -132,7 +222,11 @@ function exportBackup() {
 async function restoreBackup(text) {
   const data = JSON.parse(text);
   if (data.app !== 'ilm' || !Array.isArray(data.cards) || !Array.isArray(data.events)) throw new Error('this is not an Ilm backup file');
-  await store.replaceAll({ cards: data.cards, events: data.events, settings: data.settings });
+  // Restored history is adopted by this device, so that this device is the one that syncs it.
+  const events = data.events.map((e) => ({ ...e, device: app.device }));
+  await store.replaceAll({ cards: data.cards, events, settings: data.settings });
+  app.sync = { ...app.sync, pushed: {} };
+  await saveSync();
   await load();
 }
 
@@ -236,6 +330,7 @@ function Home() {
       ${q.locked ? html`<p class="hint">${q.locked} higher-level ${q.locked === 1 ? 'card is' : 'cards are'} waiting until the level 1 cards for their concept have been answered.</p>` : null}
     </section>
     ${needs.length ? html`<a class="row link" href="#needs"><span>Needs you</span><span class="muted">${needs.length} personal ${needs.length === 1 ? 'card' : 'cards'} to fill in ›</span></a>` : null}
+    <${SyncStatus} />
     <h2 class="label">Decks</h2>
     ${files.map((f) => html`
       <div class="row deck">
@@ -247,6 +342,18 @@ function Home() {
             onChange=${(e) => saveSettings({ mastery: { ...app.settings.mastery, [f.course]: e.target.checked } })} /> include mastery-depth cards</label>` : null}
       </div>`)}
   <//>`;
+}
+
+function SyncStatus() {
+  const s = app.sync;
+  const now = Date.now();
+  if (!s.token) return html`<a class="sync-line" href="#settings">Sync is off. Progress stays on this device. Set up ›</a>`;
+  const waiting = pendingCount();
+  let text;
+  if (s.busy) text = 'Syncing…';
+  else if (s.error) text = s.error + ' Tap to try again.';
+  else text = `Synced ${s.last ? humanInterval(now - s.last).replace('<1m', 'just now').replace(/^(\d.*)$/, '$1 ago') : 'never'}${waiting ? ` · ${waiting} waiting to send` : ''}`;
+  return html`<button class=${'sync-line' + (s.error && !s.busy ? ' bad' : '')} onClick=${() => syncNow()}>${text}</button>`;
 }
 
 // ---------------------------------------------------------------- review
@@ -629,8 +736,11 @@ function Settings() {
         <select value=${String(s.retention)} onChange=${(e) => saveSettings({ retention: Number(e.target.value) })}>
           <option value="0.85">85% (fewer reviews)</option><option value="0.9">90%</option><option value="0.95">95% (more reviews)</option></select></label>
 
+      <h2 class="label" id="sync">Sync</h2>
+      <${SyncPanel} />
+
       <h2 class="label">Backup</h2>
-      <p class="hint">Everything is stored on this device only for now. Download a backup regularly until sync is switched on.</p>
+      <p class="hint">${app.sync.token ? 'With sync on, your history is also kept in your private repository. A backup file is still a good extra.' : 'Until sync is on, everything is stored on this device only. Download a backup regularly.'}</p>
       <div class="buttons wrap">
         <button onClick=${exportBackup}>Download backup</button>
         <label class="button">Restore from backup<input type="file" accept="application/json,.json" hidden onChange=${onRestore} /></label>
@@ -648,11 +758,53 @@ function Settings() {
   <//>`;
 }
 
+function SyncPanel() {
+  const s = app.sync;
+  const [token, setToken] = useState('');
+  const [repo, setRepo] = useState(s.repo || 'mar467/ilm-data');
+  const [msg, setMsg] = useState('');
+  const [busy, setBusy] = useState(false);
+  const connect = async () => {
+    setBusy(true); setMsg('');
+    try { await connectSync(token.trim(), repo.trim()); setToken(''); }
+    catch (e) { setMsg(e instanceof SyncError ? e.message : 'Could not connect: ' + e.message); }
+    setBusy(false);
+  };
+  if (s.token) {
+    const r = s.report;
+    const waiting = pendingCount();
+    return html`
+      <p>Connected to <b>${s.repo}</b> as device <code>${app.device}</code>.</p>
+      <p class="muted">${s.busy ? 'Syncing…' : s.last ? `Last synced ${new Date(s.last).toLocaleString()}.` : 'Not synced yet.'}
+        ${r && !s.busy ? ` Sent ${r.sent}, received ${r.pulled}, card files updated ${r.cardFiles}.` : ''}${waiting && !s.busy ? ` ${waiting} waiting to send.` : ''}</p>
+      ${r && r.notes && r.notes.length ? html`<ul class="notice warn">${r.notes.map((n) => html`<li>${n}</li>`)}</ul>` : null}
+      ${s.error && !s.busy ? html`<p class="notice bad">${s.error}</p>` : null}
+      <div class="buttons wrap">
+        <button class="primary" disabled=${s.busy} onClick=${() => syncNow()}>Sync now</button>
+        <button onClick=${disconnectSync}>Disconnect this device</button>
+      </div>`;
+  }
+  return html`
+    <p class="hint">Sync keeps the same cards and progress on every device, using your private GitHub repository. Paste the access token here on each device. It is stored only in this browser.</p>
+    <label class="field"><span>Repository (owner/name)</span>
+      <input value=${repo} autocapitalize="off" autocorrect="off" spellcheck=${false} onInput=${(e) => setRepo(e.target.value)} /></label>
+    <label class="field"><span>Access token</span>
+      <input type="password" id="sync-token" autocomplete="off" placeholder="github_pat_…" value=${token} onInput=${(e) => setToken(e.target.value)} /></label>
+    ${msg ? html`<p class="notice bad">${msg}</p>` : null}
+    <div class="buttons"><span class="grow"></span>
+      <button class="primary" disabled=${busy || !token.trim() || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim())} onClick=${connect}>${busy ? 'Connecting…' : 'Connect and sync'}</button></div>`;
+}
+
 // ---------------------------------------------------------------- root
 
 function Root() {
   useApp();
   const route = useRoute();
+  const prev = useRef(route);
+  useEffect(() => {
+    if (prev.current === 'review' && route !== 'review') syncNow();
+    prev.current = route;
+  }, [route]);
   if (!app.ready) return html`<main class="empty"><p>${app.error || 'Loading…'}</p></main>`;
   let page;
   if (route === 'review') return html`<div class="screen review-screen"><${Review} /></div>`;
@@ -667,4 +819,14 @@ function Root() {
 }
 
 load().catch((e) => { app.error = 'This browser could not open local storage: ' + e.message; emit(); });
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { if (pendingCount()) syncNow(); }
+  else if (Date.now() - (app.sync.last || 0) > 5 * 60 * 1000) syncNow();
+});
+window.addEventListener('online', () => syncNow());
+
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === '127.0.0.1' || location.hostname === 'localhost')) {
+  navigator.serviceWorker.register('sw.js').catch(() => { /* the app still works without offline support */ });
+}
 render(html`<${Root} />`, document.getElementById('app'));

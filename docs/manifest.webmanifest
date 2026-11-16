@@ -1,0 +1,21 @@
+{
+  "name": "Ilm",
+  "short_name": "Ilm",
+  "description": "Personal spaced-repetition reviews: recall, understand, apply.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f6f4ef",
+  "theme_color": "#1f5c4d",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Review", "url": "./#review" },
+    { "name": "Add a card", "url": "./#add" }
+  ]
+}
